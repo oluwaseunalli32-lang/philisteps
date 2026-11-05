@@ -14,13 +14,6 @@ from telegram.ext import (
     Defaults,
 )
 
-# Webhook/Webserver imports
-import uvicorn
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
-from starlette.routing import Route
-
 # ---------- Logging ----------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -142,12 +135,12 @@ async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 
 # ---------- Flow Functions ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    logger.info(f"/start from {user.id}")
+    logger.info(f"!!! START COMMAND RECEIVED FROM {update.effective_user.id} !!!")
     context.user_data.clear()
 
     try:
-        await update.message.delete()
+        if update.message:
+            await update.message.delete()
     except Exception:
         pass
 
@@ -218,6 +211,7 @@ async def handle_registered_yes(update: Update, context: ContextTypes.DEFAULT_TY
         with open(SLOT_IMAGE_PATH, "rb") as photo:
             m = await context.bot.send_photo(chat_id, photo=photo, caption=t["slot_caption"])
     except FileNotFoundError:
+        logger.warning(f"{SLOT_IMAGE_PATH} missing - sending text fallback.")
         m = await context.bot.send_message(chat_id, "[Image missing]")
     await track(m, context); new_ids.add(m.message_id)
 
@@ -314,18 +308,17 @@ async def handle_reminder_play(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
     return await start(update, context)
 
-# ---------- Main & Webhook Setup ----------
+# ---------- Main (Polling) ----------
 def main() -> None:
     TOKEN = os.environ.get("BOT_TOKEN")
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN env var is not set.")
 
-    # Build the application (updater=None for webhook mode)
+    # Build the application using polling (no webhooks)
     application = (
         Application.builder()
         .token(TOKEN)
         .defaults(Defaults(tzinfo=MANILA_TZ))
-        .updater(None)
         .build()
     )
 
@@ -347,6 +340,7 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False
     )
     
     application.add_handler(conv_handler)
@@ -360,46 +354,9 @@ def main() -> None:
             name="five_hour_rotating_reminder",
         )
 
-    # --- Web Server Setup (Starlette + Uvicorn) ---
-    URL = os.environ.get("RENDER_EXTERNAL_URL")
-    PORT = int(os.environ.get("PORT", 8000))
-
-    async def telegram(request: Request) -> Response:
-        """Handle incoming Telegram updates."""
-        await application.update_queue.put(
-            Update.de_json(data=await request.json(), bot=application.bot)
-        )
-        return Response()
-
-    async def health(_: Request) -> PlainTextResponse:
-        """Render health check endpoint to prevent sleeping."""
-        return PlainTextResponse(content="Bot is running fine :)")
-
-    starlette_app = Starlette(
-        routes=[
-            Route("/telegram", telegram, methods=["POST"]),
-            Route("/healthcheck", health, methods=["GET"]),
-        ]
-    )
-    
-    webserver = uvicorn.Server(
-        config=uvicorn.Config(app=starlette_app, port=PORT, use_colors=False, host="0.0.0.0")
-    )
-
-    async def run_bot():
-        if URL:
-            logger.info(f"Setting webhook to {URL}/telegram")
-            await application.bot.set_webhook(url=f"{URL}/telegram", allowed_updates=Update.ALL_TYPES)
-        else:
-            logger.warning("RENDER_EXTERNAL_URL not found. Webhook not set.")
-            
-        async with application:
-            await application.start()
-            await webserver.serve()
-            await application.stop()
-
-    logger.info("Bot starting (webhook)...")
-    asyncio.run(run_bot())
+    logger.info("Bot starting (polling)...")
+    # This is the standard way to run a background worker
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
