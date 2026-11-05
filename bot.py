@@ -14,6 +14,13 @@ from telegram.ext import (
     Defaults,
 )
 
+# Webhook/Webserver imports
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
+
 # ---------- Logging ----------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -119,12 +126,10 @@ def register_user(chat_id: int, lang: str, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Message tracking & deletion ----------
 async def track(msg, context: ContextTypes.DEFAULT_TYPE):
-    """Adds message ID to the tracking list."""
     context.user_data.setdefault("msg_ids", []).append(msg.message_id)
     return msg
 
 async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, keep=None):
-    """Deletes all tracked messages EXCEPT the ones in 'keep'."""
     keep = keep or set()
     for mid in list(context.user_data.get("msg_ids", [])):
         if mid in keep:
@@ -132,8 +137,7 @@ async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         try:
             await context.bot.delete_message(chat_id, mid)
         except Exception:
-            pass # Ignore if message was already deleted by the user
-    # Update the tracking list to only keep the new messages
+            pass
     context.user_data["msg_ids"] = [m for m in context.user_data.get("msg_ids", []) if m in keep]
 
 # ---------- Flow Functions ----------
@@ -143,13 +147,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
 
     try:
-        await update.message.delete() # Delete the /start command
+        await update.message.delete()
     except Exception:
         pass
 
     chat_id = update.effective_chat.id
 
-    # Language selection
     keyboard = [
         [
             InlineKeyboardButton("English", callback_data="lang_en"),
@@ -174,13 +177,11 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     register_user(chat_id, lang, context)
     
     t = TEXTS[lang]
-    new_ids = set() # We will track the NEW messages to keep them
+    new_ids = set()
 
-    # 1) Hook message
     m1 = await context.bot.send_message(chat_id, t["hook"])
     await track(m1, context); new_ids.add(m1.message_id)
 
-    # 2) Wait 2s -> register button
     await asyncio.sleep(2)
     keyboard = [[InlineKeyboardButton(t["btn_register"], url=REGISTER_URL)]]
     m2 = await context.bot.send_message(
@@ -188,7 +189,6 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     await track(m2, context); new_ids.add(m2.message_id)
 
-    # 3) Wait 4s -> Yes/No buttons
     await asyncio.sleep(4)
     keyboard = [[
         InlineKeyboardButton(t["btn_yes"], callback_data="registered_yes"),
@@ -199,7 +199,6 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     await track(m3, context); new_ids.add(m3.message_id)
 
-    # DELETE OLD MESSAGES (This deletes the language selector message)
     await delete_old_messages(context, chat_id, keep=new_ids)
     return ASK_REGISTERED
 
@@ -228,7 +227,6 @@ async def handle_registered_yes(update: Update, context: ContextTypes.DEFAULT_TY
     )
     await track(m, context); new_ids.add(m.message_id)
 
-    # DELETE OLD MESSAGES (Deletes the 3 previous messages from the "hook" phase)
     await delete_old_messages(context, chat_id, keep=new_ids)
     return SLOT_MACHINE
 
@@ -256,7 +254,6 @@ async def handle_registered_no(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     await track(m, context); new_ids.add(m.message_id)
 
-    # DELETE OLD MESSAGES
     await delete_old_messages(context, chat_id, keep=new_ids)
     return ASK_REGISTERED
 
@@ -270,7 +267,6 @@ async def handle_found_it(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     m = await context.bot.send_message(chat_id, t["instructions"], parse_mode="HTML")
     await track(m, context)
 
-    # DELETE OLD MESSAGES (Deletes the slot machine image and button, keeping only the final text)
     await delete_old_messages(context, chat_id, keep={m.message_id})
     return ConversationHandler.END
 
@@ -318,16 +314,18 @@ async def handle_reminder_play(update: Update, context: ContextTypes.DEFAULT_TYP
         pass
     return await start(update, context)
 
-# ---------- Main ----------
+# ---------- Main & Webhook Setup ----------
 def main() -> None:
     TOKEN = os.environ.get("BOT_TOKEN")
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN env var is not set.")
 
+    # Build the application (updater=None for webhook mode)
     application = (
         Application.builder()
         .token(TOKEN)
         .defaults(Defaults(tzinfo=MANILA_TZ))
+        .updater(None)
         .build()
     )
 
@@ -362,9 +360,46 @@ def main() -> None:
             name="five_hour_rotating_reminder",
         )
 
-    logger.info("Bot starting (polling)...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # --- Web Server Setup (Starlette + Uvicorn) ---
+    URL = os.environ.get("RENDER_EXTERNAL_URL")
+    PORT = int(os.environ.get("PORT", 8000))
 
+    async def telegram(request: Request) -> Response:
+        """Handle incoming Telegram updates."""
+        await application.update_queue.put(
+            Update.de_json(data=await request.json(), bot=application.bot)
+        )
+        return Response()
+
+    async def health(_: Request) -> PlainTextResponse:
+        """Render health check endpoint to prevent sleeping."""
+        return PlainTextResponse(content="Bot is running fine :)")
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/telegram", telegram, methods=["POST"]),
+            Route("/healthcheck", health, methods=["GET"]),
+        ]
+    )
+    
+    webserver = uvicorn.Server(
+        config=uvicorn.Config(app=starlette_app, port=PORT, use_colors=False, host="0.0.0.0")
+    )
+
+    async def run_bot():
+        if URL:
+            logger.info(f"Setting webhook to {URL}/telegram")
+            await application.bot.set_webhook(url=f"{URL}/telegram", allowed_updates=Update.ALL_TYPES)
+        else:
+            logger.warning("RENDER_EXTERNAL_URL not found. Webhook not set.")
+            
+        async with application:
+            await application.start()
+            await webserver.serve()
+            await application.stop()
+
+    logger.info("Bot starting (webhook)...")
+    asyncio.run(run_bot())
 
 if __name__ == "__main__":
     main()
