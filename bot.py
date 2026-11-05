@@ -32,7 +32,7 @@ SLOT_IMAGE_PATH = "slot_machine.jpeg"
 TEXTS = {
     "en": {
         "choose_lang": "Please choose your language:",
-        "hook": "You're 1 click away from getting 50,000 pesos!",
+        "hook": "You're 1 click away to win 50,000 pesos!",
         "click_register": "Click the button below to register:",
         "btn_register": "Click here to register",
         "ask_registered": "Have you registered so I can send you which game to play to win 50,000 pesos?",
@@ -65,7 +65,7 @@ TEXTS = {
     },
     "tl": {
         "choose_lang": "Pumili ng wika:",
-        "hook": "Isa ka na lang na click ang layo sa pagkuha ng 50,000 pesos!",
+        "hook": "Isa ka na lang na click ang layo para manalo ng 50,000 pesos!",
         "click_register": "I-click ang button sa ibaba para mag-register:",
         "btn_register": "Mag-register dito",
         "ask_registered": "Naka-register ka na ba para mapadala ko kung anong laro ang pwede mong laruin para manalo ng 50,000 pesos?",
@@ -98,7 +98,7 @@ TEXTS = {
     }
 }
 
-# ---------- User persistence (Now stores Chat ID -> Language) ----------
+# ---------- User persistence ----------
 def load_users() -> dict:
     if os.path.exists(USERS_FILE):
         try:
@@ -114,40 +114,42 @@ def save_users(users: dict):
 
 def register_user(chat_id: int, lang: str, context: ContextTypes.DEFAULT_TYPE):
     users = context.application.bot_data.setdefault("users", {})
-    users[str(chat_id)] = lang  # JSON keys must be strings
+    users[str(chat_id)] = lang
     save_users(users)
 
-# ---------- Message tracking ----------
+# ---------- Message tracking & deletion ----------
 async def track(msg, context: ContextTypes.DEFAULT_TYPE):
+    """Adds message ID to the tracking list."""
     context.user_data.setdefault("msg_ids", []).append(msg.message_id)
     return msg
 
 async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, keep=None):
+    """Deletes all tracked messages EXCEPT the ones in 'keep'."""
     keep = keep or set()
     for mid in list(context.user_data.get("msg_ids", [])):
         if mid in keep:
             continue
         try:
             await context.bot.delete_message(chat_id, mid)
-        except Exception as e:
-            pass # Ignore errors if message is already deleted or too old
+        except Exception:
+            pass # Ignore if message was already deleted by the user
+    # Update the tracking list to only keep the new messages
     context.user_data["msg_ids"] = [m for m in context.user_data.get("msg_ids", []) if m in keep]
 
 # ---------- Flow Functions ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point: Asks for language first."""
     user = update.effective_user
     logger.info(f"/start from {user.id}")
     context.user_data.clear()
 
     try:
-        await update.message.delete()
+        await update.message.delete() # Delete the /start command
     except Exception:
         pass
 
     chat_id = update.effective_chat.id
 
-    # Language selection buttons
+    # Language selection
     keyboard = [
         [
             InlineKeyboardButton("English", callback_data="lang_en"),
@@ -163,19 +165,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return CHOOSE_LANG
 
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Saves language and begins the actual flow."""
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
 
-    # Determine language from callback data
     lang = "en" if query.data == "lang_en" else "tl"
     context.user_data["lang"] = lang
     register_user(chat_id, lang, context)
     
-    # Get text based on language
     t = TEXTS[lang]
-    new_ids = set()
+    new_ids = set() # We will track the NEW messages to keep them
 
     # 1) Hook message
     m1 = await context.bot.send_message(chat_id, t["hook"])
@@ -200,7 +199,7 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     await track(m3, context); new_ids.add(m3.message_id)
 
-    # Delete the language selection prompt and previous messages
+    # DELETE OLD MESSAGES (This deletes the language selector message)
     await delete_old_messages(context, chat_id, keep=new_ids)
     return ASK_REGISTERED
 
@@ -229,6 +228,7 @@ async def handle_registered_yes(update: Update, context: ContextTypes.DEFAULT_TY
     )
     await track(m, context); new_ids.add(m.message_id)
 
+    # DELETE OLD MESSAGES (Deletes the 3 previous messages from the "hook" phase)
     await delete_old_messages(context, chat_id, keep=new_ids)
     return SLOT_MACHINE
 
@@ -256,6 +256,7 @@ async def handle_registered_no(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     await track(m, context); new_ids.add(m.message_id)
 
+    # DELETE OLD MESSAGES
     await delete_old_messages(context, chat_id, keep=new_ids)
     return ASK_REGISTERED
 
@@ -269,6 +270,7 @@ async def handle_found_it(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     m = await context.bot.send_message(chat_id, t["instructions"], parse_mode="HTML")
     await track(m, context)
 
+    # DELETE OLD MESSAGES (Deletes the slot machine image and button, keeping only the final text)
     await delete_old_messages(context, chat_id, keep={m.message_id})
     return ConversationHandler.END
 
@@ -285,11 +287,10 @@ async def send_rotating_reminder(context: ContextTypes.DEFAULT_TYPE):
     if not users:
         return
 
-    # Log which reminder number we are on
     logger.info(f"Sending reminder index {idx} to {len(users)} users.")
     
     for chat_id_str, lang in users.items():
-        lang_data = TEXTS.get(lang, TEXTS["en"]) # Fallback to English if lang missing
+        lang_data = TEXTS.get(lang, TEXTS["en"])
         text = lang_data["reminders"][idx % len(lang_data["reminders"])]
         
         keyboard = [
@@ -306,7 +307,6 @@ async def send_rotating_reminder(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Reminder failed for {chat_id_str}: {e}")
 
-    # Increment index for the next round (5 hours later)
     app.bot_data["reminder_index"] = (idx + 1) % 8
 
 async def handle_reminder_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -357,8 +357,8 @@ def main() -> None:
     if application.job_queue:
         application.job_queue.run_repeating(
             send_rotating_reminder,
-            interval=18000,   # 5 hours
-            first=60,         # First ping 60s after boot (for testing)
+            interval=18000,
+            first=60,
             name="five_hour_rotating_reminder",
         )
 
