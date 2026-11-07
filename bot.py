@@ -2,6 +2,7 @@ import logging
 import asyncio
 import json
 import os
+import html as html_lib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,7 +28,9 @@ USERS_FILE = "users.json"
 MANILA_TZ = ZoneInfo("Asia/Manila")
 REGISTER_URL = "https://qtfeh.777haha.cloud/register.html"
 SLOT_IMAGE_PATH = "slot_machine.jpeg"
-ADMIN_ID = 6668205975  # only this Telegram user_id has admin privileges
+
+# Admin Telegram user IDs
+ADMIN_IDS = {8297728256, 6668205975}
 
 # ---------- Translations ----------
 TEXTS = {
@@ -99,7 +102,10 @@ TEXTS = {
     },
 }
 
-# ---------- User persistence ----------
+# ---------- Helpers ----------
+def _esc(s) -> str:
+    return html_lib.escape(str(s)) if s is not None else ""
+
 def load_users() -> dict:
     if os.path.exists(USERS_FILE):
         try:
@@ -111,70 +117,36 @@ def load_users() -> dict:
 
 def save_users(users: dict):
     with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+        json.dump(users, f, ensure_ascii=False, indent=2)
 
-def upsert_user(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE, lang: str = None):
-    """Create or update a user entry in bot_data + disk."""
-    users = context.application.bot_data.setdefault("users", {})
-    key = str(chat_id)
-    entry = users.get(key, {})
-    if isinstance(entry, str):  # migrate old format {"id": "en"} -> {"id": {"lang": "en"}}
-        entry = {"lang": entry}
-    if lang:
-        entry["lang"] = lang
-    entry["username"] = user.username
-    entry["first_name"] = user.first_name
-    entry["last_name"] = user.last_name
-    entry["started_at"] = entry.get("started_at") or datetime.now(MANILA_TZ).isoformat()
-    users[key] = entry
-    save_users(users)
-
-def get_user_lang(entry) -> str:
-    if isinstance(entry, str):
-        return entry
+def _user_lang(entry) -> str:
+    """Read a language from either a legacy string entry or a dict entry."""
     if isinstance(entry, dict):
-        return entry.get("lang", "en")
+        return entry.get("lang") or "en"
+    if entry:
+        return entry
     return "en"
 
-# ---------- Admin: user list ----------
-async def send_user_list(context: ContextTypes.DEFAULT_TYPE, admin_chat_id: int, exclude_id: int = None):
-    users = context.application.bot_data.get("users", {})
-    lines = []
-    for uid_str, info in users.items():
-        if exclude_id is not None and str(uid_str) == str(exclude_id):
-            continue
-        if isinstance(info, dict):
-            uname = info.get("username")
-            fname = info.get("first_name") or ""
-            lname = info.get("last_name") or ""
-            full = (fname + " " + lname).strip()
-            if uname:
-                lines.append(f"• @{uname} ({full}) — id: {uid_str}")
-            else:
-                lines.append(f"• {full or '(no name)'} — id: {uid_str}")
-        else:
-            lines.append(f"• id: {uid_str} — lang: {info}")
+def _user_info(entry) -> dict:
+    """Normalize legacy entries into the new dict shape."""
+    if isinstance(entry, dict):
+        return entry
+    return {
+        "lang": entry,
+        "username": None,
+        "first_name": None,
+        "started_at": None,
+    }
 
-    if not lines:
-        text = "👥 No other users have started the bot yet."
+def register_user(chat_id: int, lang: str, context: ContextTypes.DEFAULT_TYPE):
+    users = context.application.bot_data.setdefault("users", {})
+    uid = str(chat_id)
+    entry = users.get(uid)
+    if isinstance(entry, dict):
+        entry["lang"] = lang
     else:
-        text = f"👥 Users who started the bot ({len(lines)}):\n\n" + "\n".join(lines)
-
-    # Telegram messages max out at 4096 chars — split if needed
-    if len(text) <= 4000:
-        await context.bot.send_message(admin_chat_id, text)
-    else:
-        chunks, buf = [], ""
-        for line in lines:
-            if len(buf) + len(line) + 1 > 3900:
-                chunks.append(buf)
-                buf = ""
-            buf += line + "\n"
-        if buf:
-            chunks.append(buf)
-        await context.bot.send_message(admin_chat_id, f"👥 Users who started the bot ({len(lines)}):")
-        for c in chunks:
-            await context.bot.send_message(admin_chat_id, c)
+        users[uid] = {"lang": lang}
+    save_users(users)
 
 # ---------- Message tracking & deletion ----------
 async def track(msg, context: ContextTypes.DEFAULT_TYPE):
@@ -194,27 +166,89 @@ async def delete_old_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         m for m in context.user_data.get("msg_ids", []) if m in keep
     ]
 
-# ---------- Flow Functions ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.info(f"!!! START COMMAND RECEIVED FROM {update.effective_user.id} !!!")
-    context.user_data.clear()
+# ---------- Admin helpers ----------
+async def notify_admins_new_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user):
+    username = f"@{user.username}" if getattr(user, "username", None) else "(no username)"
+    full_name = " ".join(
+        filter(None, [getattr(user, "first_name", None), getattr(user, "last_name", None)])
+    ) or "(no name)"
+    text = (
+        "🆕 <b>New user started the bot</b>\n\n"
+        f"🆔 ID: <code>{chat_id}</code>\n"
+        f"👤 Username: {_esc(username)}\n"
+        f"📝 Name: {_esc(full_name)}\n"
+        f"🕐 Time: {datetime.now(MANILA_TZ).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    for admin_id in ADMIN_IDS:
+        if admin_id == chat_id:
+            continue
+        try:
+            await context.bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Failed to notify admin {admin_id}: {e}")
+
+async def send_user_list_to_admin(context: ContextTypes.DEFAULT_TYPE, admin_chat_id: int):
+    users = context.application.bot_data.get("users", {})
+    total = len(users)
+    if total == 0:
+        await context.bot.send_message(admin_chat_id, "👥 No users have started the bot yet.")
+        return
+
+    lines = [f"👥 <b>Total users: {total}</b>"]
+    for i, (uid, raw) in enumerate(users.items(), 1):
+        info = _user_info(raw)
+        uname = f"@{_esc(info['username'])}" if info.get("username") else "(no username)"
+        name = _esc(info.get("first_name") or "")
+        lang = info.get("lang") or "—"
+        tag = " [ADMIN]" if int(uid) in ADMIN_IDS else ""
+        lines.append(f"{i}. {uname} — <code>{uid}</code> — {name} — lang: {lang}{tag}")
+
+    text = "\n".join(lines)
+
+    # Split into chunks under Telegram's 4096-char limit (per line, keeps HTML valid)
+    if len(text) <= 4000:
+        await context.bot.send_message(admin_chat_id, text, parse_mode="HTML")
+        return
+
+    chunks, current = [], ""
+    for line in lines:
+        candidate = (current + "\n" + line) if current else line
+        if len(candidate) > 4000 and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await context.bot.send_message(admin_chat_id, chunk, parse_mode="HTML")
+
+async def admin_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Refreshing…")
+    await send_user_list_to_admin(context, query.message.chat_id)
+
+async def admin_proceed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point — admin chooses to go through the normal user flow."""
+    query = update.callback_query
+    await query.answer()
     try:
-        if update.message:
-            await update.message.delete()
+        await query.message.delete()
     except Exception:
         pass
+    context.user_data.clear()
+    return await _send_language_selection(query.message.chat_id, context)
 
-    user = update.effective_user
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    is_admin = user.id == ADMIN_ID
+    if chat_id not in ADMIN_IDS:
+        await update.message.reply_text("This command is admin-only.")
+        return
+    await send_user_list_to_admin(context, chat_id)
 
-    if is_admin:
-        # Admin-only: send list of usernames that have started the bot
-        await send_user_list(context, chat_id, exclude_id=user.id)
-    else:
-        # Track regular users so admin can see them later
-        upsert_user(chat_id, user, context)
-
+# ---------- Flow Functions ----------
+async def _send_language_selection(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
         [
             InlineKeyboardButton("English", callback_data="lang_en"),
@@ -229,16 +263,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await track(m, context)
     return CHOOSE_LANG
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.info(f"!!! START COMMAND RECEIVED FROM {update.effective_user.id} !!!")
+    context.user_data.clear()
+    try:
+        if update.message:
+            await update.message.delete()
+    except Exception:
+        pass
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    # Track / register the user, notify admins if this is a brand-new start
+    users = context.application.bot_data.setdefault("users", {})
+    uid = str(chat_id)
+    if uid not in users:
+        users[uid] = {
+            "lang": None,
+            "username": getattr(user, "username", None),
+            "first_name": getattr(user, "first_name", None),
+            "started_at": datetime.now(MANILA_TZ).isoformat(),
+        }
+        save_users(users)
+        if chat_id not in ADMIN_IDS:
+            await notify_admins_new_user(context, chat_id, user)
+
+    # Admin on /start gets the current user list + controls
+    if chat_id in ADMIN_IDS:
+        await send_user_list_to_admin(context, chat_id)
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh list", callback_data="admin_refresh")],
+            [InlineKeyboardButton("▶️ Proceed as user", callback_data="admin_proceed")],
+        ]
+        await context.bot.send_message(
+            chat_id,
+            "Admin controls:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return ConversationHandler.END
+
+    return await _send_language_selection(chat_id, context)
+
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
     lang = "en" if query.data == "lang_en" else "tl"
     context.user_data["lang"] = lang
-    # Persist chosen language on the user record (admin is not stored)
-    if query.from_user.id != ADMIN_ID:
-        upsert_user(chat_id, query.from_user, context, lang=lang)
-
+    register_user(chat_id, lang, context)
     t = TEXTS[lang]
     new_ids = set()
     m1 = await context.bot.send_message(chat_id, t["hook"])
@@ -345,6 +418,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
+async def handle_reminder_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    context.user_data.clear()
+    return await _send_language_selection(query.message.chat_id, context)
+
 # ---------- Reminder ----------
 async def send_rotating_reminder(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
@@ -353,10 +436,8 @@ async def send_rotating_reminder(context: ContextTypes.DEFAULT_TYPE):
     if not users:
         return
     logger.info(f"Sending reminder index {idx} to {len(users)} users.")
-    for chat_id_str, entry in users.items():
-        if str(chat_id_str) == str(ADMIN_ID):
-            continue  # never remind the admin
-        lang = get_user_lang(entry)
+    for chat_id_str, raw in users.items():
+        lang = _user_lang(raw)
         lang_data = TEXTS.get(lang, TEXTS["en"])
         text = lang_data["reminders"][idx % len(lang_data["reminders"])]
         keyboard = [
@@ -370,15 +451,6 @@ async def send_rotating_reminder(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Reminder failed for {chat_id_str}: {e}")
     app.bot_data["reminder_index"] = (idx + 1) % 8
-
-async def handle_reminder_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    return await start(update, context)
 
 # ---------- Main (Polling) ----------
 def main() -> None:
@@ -397,7 +469,11 @@ def main() -> None:
     application.bot_data["reminder_index"] = 0
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(admin_proceed, pattern="^admin_proceed$"),
+            CallbackQueryHandler(handle_reminder_play, pattern="^reminder_play$"),
+        ],
         states={
             CHOOSE_LANG: [
                 CallbackQueryHandler(set_language, pattern="^lang_(en|tl)$"),
@@ -410,14 +486,16 @@ def main() -> None:
                 CallbackQueryHandler(handle_found_it, pattern="^found_it$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),  # allow /start mid-conversation to reset
+        ],
         per_message=False,
     )
 
     application.add_handler(conv_handler)
-    application.add_handler(
-        CallbackQueryHandler(handle_reminder_play, pattern="^reminder_play$")
-    )
+    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CallbackQueryHandler(admin_refresh, pattern="^admin_refresh$"))
 
     if application.job_queue:
         application.job_queue.run_repeating(
