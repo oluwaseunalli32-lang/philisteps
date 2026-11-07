@@ -2,6 +2,7 @@ import logging
 import asyncio
 import json
 import os
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,6 +27,7 @@ USERS_FILE = "users.json"
 MANILA_TZ = ZoneInfo("Asia/Manila")
 REGISTER_URL = "https://qtfeh.777haha.cloud/register.html"
 SLOT_IMAGE_PATH = "slot_machine.jpeg"
+ADMIN_ID = 6668205975  # only this Telegram user_id has admin privileges
 
 # ---------- Translations ----------
 TEXTS = {
@@ -109,12 +111,70 @@ def load_users() -> dict:
 
 def save_users(users: dict):
     with open(USERS_FILE, "w") as f:
-        json.dump(users, f)
+        json.dump(users, f, indent=2)
 
-def register_user(chat_id: int, lang: str, context: ContextTypes.DEFAULT_TYPE):
+def upsert_user(chat_id: int, user, context: ContextTypes.DEFAULT_TYPE, lang: str = None):
+    """Create or update a user entry in bot_data + disk."""
     users = context.application.bot_data.setdefault("users", {})
-    users[str(chat_id)] = lang
+    key = str(chat_id)
+    entry = users.get(key, {})
+    if isinstance(entry, str):  # migrate old format {"id": "en"} -> {"id": {"lang": "en"}}
+        entry = {"lang": entry}
+    if lang:
+        entry["lang"] = lang
+    entry["username"] = user.username
+    entry["first_name"] = user.first_name
+    entry["last_name"] = user.last_name
+    entry["started_at"] = entry.get("started_at") or datetime.now(MANILA_TZ).isoformat()
+    users[key] = entry
     save_users(users)
+
+def get_user_lang(entry) -> str:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("lang", "en")
+    return "en"
+
+# ---------- Admin: user list ----------
+async def send_user_list(context: ContextTypes.DEFAULT_TYPE, admin_chat_id: int, exclude_id: int = None):
+    users = context.application.bot_data.get("users", {})
+    lines = []
+    for uid_str, info in users.items():
+        if exclude_id is not None and str(uid_str) == str(exclude_id):
+            continue
+        if isinstance(info, dict):
+            uname = info.get("username")
+            fname = info.get("first_name") or ""
+            lname = info.get("last_name") or ""
+            full = (fname + " " + lname).strip()
+            if uname:
+                lines.append(f"• @{uname} ({full}) — id: {uid_str}")
+            else:
+                lines.append(f"• {full or '(no name)'} — id: {uid_str}")
+        else:
+            lines.append(f"• id: {uid_str} — lang: {info}")
+
+    if not lines:
+        text = "👥 No other users have started the bot yet."
+    else:
+        text = f"👥 Users who started the bot ({len(lines)}):\n\n" + "\n".join(lines)
+
+    # Telegram messages max out at 4096 chars — split if needed
+    if len(text) <= 4000:
+        await context.bot.send_message(admin_chat_id, text)
+    else:
+        chunks, buf = [], ""
+        for line in lines:
+            if len(buf) + len(line) + 1 > 3900:
+                chunks.append(buf)
+                buf = ""
+            buf += line + "\n"
+        if buf:
+            chunks.append(buf)
+        await context.bot.send_message(admin_chat_id, f"👥 Users who started the bot ({len(lines)}):")
+        for c in chunks:
+            await context.bot.send_message(admin_chat_id, c)
 
 # ---------- Message tracking & deletion ----------
 async def track(msg, context: ContextTypes.DEFAULT_TYPE):
@@ -143,7 +203,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.delete()
     except Exception:
         pass
+
+    user = update.effective_user
     chat_id = update.effective_chat.id
+    is_admin = user.id == ADMIN_ID
+
+    if is_admin:
+        # Admin-only: send list of usernames that have started the bot
+        await send_user_list(context, chat_id, exclude_id=user.id)
+    else:
+        # Track regular users so admin can see them later
+        upsert_user(chat_id, user, context)
+
     keyboard = [
         [
             InlineKeyboardButton("English", callback_data="lang_en"),
@@ -164,7 +235,10 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     chat_id = query.message.chat_id
     lang = "en" if query.data == "lang_en" else "tl"
     context.user_data["lang"] = lang
-    register_user(chat_id, lang, context)
+    # Persist chosen language on the user record (admin is not stored)
+    if query.from_user.id != ADMIN_ID:
+        upsert_user(chat_id, query.from_user, context, lang=lang)
+
     t = TEXTS[lang]
     new_ids = set()
     m1 = await context.bot.send_message(chat_id, t["hook"])
@@ -279,7 +353,10 @@ async def send_rotating_reminder(context: ContextTypes.DEFAULT_TYPE):
     if not users:
         return
     logger.info(f"Sending reminder index {idx} to {len(users)} users.")
-    for chat_id_str, lang in users.items():
+    for chat_id_str, entry in users.items():
+        if str(chat_id_str) == str(ADMIN_ID):
+            continue  # never remind the admin
+        lang = get_user_lang(entry)
         lang_data = TEXTS.get(lang, TEXTS["en"])
         text = lang_data["reminders"][idx % len(lang_data["reminders"])]
         keyboard = [
