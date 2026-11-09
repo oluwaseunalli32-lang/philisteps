@@ -13,6 +13,8 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     Defaults,
+    MessageHandler,
+    filters,
 )
 
 # ---------- Logging ----------
@@ -23,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------- Constants ----------
-CHOOSE_LANG, ASK_REGISTERED, SLOT_MACHINE = range(3)
+CHOOSE_LANG, ASK_REGISTERED, SLOT_MACHINE, BROADCAST_WAIT, BROADCAST_CONFIRM = range(5)
 USERS_FILE = "users.json"
 MANILA_TZ = ZoneInfo("Asia/Manila")
 REGISTER_URL = "https://qtfeh.777haha.cloud/register.html"
@@ -31,6 +33,10 @@ SLOT_IMAGE_PATH = "slot_machine.jpeg"
 
 # Admin Telegram user IDs
 ADMIN_IDS = {8297728256, 6668205975}
+
+# Broadcast pacing — ~20 msgs/sec, well under Telegram's ~30/sec limit
+BROADCAST_DELAY = 0.05
+PROGRESS_EVERY = 50
 
 # ---------- Translations ----------
 TEXTS = {
@@ -205,7 +211,6 @@ async def send_user_list_to_admin(context: ContextTypes.DEFAULT_TYPE, admin_chat
 
     text = "\n".join(lines)
 
-    # Split into chunks under Telegram's 4096-char limit (per line, keeps HTML valid)
     if len(text) <= 4000:
         await context.bot.send_message(admin_chat_id, text, parse_mode="HTML")
         return
@@ -230,7 +235,6 @@ async def admin_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_user_list_to_admin(context, query.message.chat_id)
 
 async def admin_proceed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point — admin chooses to go through the normal user flow."""
     query = update.callback_query
     await query.answer()
     try:
@@ -246,6 +250,139 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This command is admin-only.")
         return
     await send_user_list_to_admin(context, chat_id)
+
+# ---------- Broadcast (admin-only) ----------
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point from /broadcast. Admin-only."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        if update.message:
+            await update.message.reply_text("⛔ This command is admin-only.")
+        return ConversationHandler.END
+
+    context.user_data["broadcast_src"] = None
+    await update.message.reply_text(
+        "📢 <b>Broadcast mode</b>\n\n"
+        "Send me the message you want to broadcast to all users. "
+        "It can be text, photo, video, sticker, document, forwarded content, etc.\n\n"
+        "Type /cancel to abort.",
+        parse_mode="HTML",
+    )
+    return BROADCAST_WAIT
+
+async def admin_broadcast_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point from the 📢 button inside admin /start panel."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+
+    context.user_data["broadcast_src"] = None
+    await context.bot.send_message(
+        query.message.chat_id,
+        "📢 <b>Broadcast mode</b>\n\n"
+        "Send me the message you want to broadcast to all users. "
+        "It can be text, photo, video, sticker, document, forwarded content, etc.\n\n"
+        "Type /cancel to abort.",
+        parse_mode="HTML",
+    )
+    return BROADCAST_WAIT
+
+async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin sent a message to broadcast — show preview + confirm."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+
+    msg = update.message
+    context.user_data["broadcast_src"] = {
+        "chat_id": msg.chat_id,
+        "message_id": msg.message_id,
+    }
+
+    users = context.application.bot_data.get("users", {})
+    target_ids = [int(uid) for uid in users if int(uid) not in ADMIN_IDS]
+
+    if not target_ids:
+        await msg.reply_text("⚠️ No users to send to (admins excluded). Broadcast cancelled.")
+        context.user_data.pop("broadcast_src", None)
+        return ConversationHandler.END
+
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Send to {len(target_ids)} users", callback_data="broadcast_go")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_abort")],
+    ]
+    await msg.reply_text(
+        f"📢 This will be sent to <b>{len(target_ids)}</b> users (admins excluded).\n\n"
+        "Confirm?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+    return BROADCAST_CONFIRM
+
+async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin clicked Go or Cancel."""
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+
+    if query.data == "broadcast_abort":
+        await query.message.edit_text("❌ Broadcast cancelled.")
+        context.user_data.pop("broadcast_src", None)
+        return ConversationHandler.END
+
+    src = context.user_data.get("broadcast_src")
+    if not src:
+        await query.message.edit_text("❌ No message to broadcast. Cancelled.")
+        return ConversationHandler.END
+
+    users = context.application.bot_data.get("users", {})
+    target_ids = [int(uid) for uid in users if int(uid) not in ADMIN_IDS]
+    total = len(target_ids)
+
+    if total == 0:
+        await query.message.edit_text("⚠️ No users to send to.")
+        context.user_data.pop("broadcast_src", None)
+        return ConversationHandler.END
+
+    await query.message.edit_text(f"📢 Broadcasting to {total} users…")
+
+    success, failed = 0, 0
+    for i, uid in enumerate(target_ids, 1):
+        try:
+            await context.bot.copy_message(
+                chat_id=uid,
+                from_chat_id=src["chat_id"],
+                message_id=src["message_id"],
+            )
+            success += 1
+        except Exception as e:
+            logger.warning(f"Broadcast failed for {uid}: {e}")
+            failed += 1
+
+        if i % PROGRESS_EVERY == 0 and i < total:
+            try:
+                await query.message.edit_text(
+                    f"📢 Broadcasting… {i}/{total}  (✅ {success}, ❌ {failed})"
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(BROADCAST_DELAY)
+
+    await query.message.edit_text(
+        f"✅ <b>Broadcast complete</b>\n\n"
+        f"📤 Total: <b>{total}</b>\n"
+        f"✅ Delivered: <b>{success}</b>\n"
+        f"❌ Failed: <b>{failed}</b>",
+        parse_mode="HTML",
+    )
+    context.user_data.pop("broadcast_src", None)
+    return ConversationHandler.END
 
 # ---------- Flow Functions ----------
 async def _send_language_selection(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -275,7 +412,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     user = update.effective_user
 
-    # Track / register the user, notify admins if this is a brand-new start
     users = context.application.bot_data.setdefault("users", {})
     uid = str(chat_id)
     if uid not in users:
@@ -289,11 +425,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if chat_id not in ADMIN_IDS:
             await notify_admins_new_user(context, chat_id, user)
 
-    # Admin on /start gets the current user list + controls
     if chat_id in ADMIN_IDS:
         await send_user_list_to_admin(context, chat_id)
         keyboard = [
             [InlineKeyboardButton("🔄 Refresh list", callback_data="admin_refresh")],
+            [InlineKeyboardButton("📢 Broadcast message", callback_data="admin_broadcast")],
             [InlineKeyboardButton("▶️ Proceed as user", callback_data="admin_proceed")],
         ]
         await context.bot.send_message(
@@ -415,7 +551,9 @@ async def handle_found_it(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Cancelled.")
+    context.user_data.pop("broadcast_src", None)
+    if update.message:
+        await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 async def handle_reminder_play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -471,7 +609,9 @@ def main() -> None:
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler("broadcast", broadcast_command),
             CallbackQueryHandler(admin_proceed, pattern="^admin_proceed$"),
+            CallbackQueryHandler(admin_broadcast_button, pattern="^admin_broadcast$"),
             CallbackQueryHandler(handle_reminder_play, pattern="^reminder_play$"),
         ],
         states={
@@ -485,10 +625,17 @@ def main() -> None:
             SLOT_MACHINE: [
                 CallbackQueryHandler(handle_found_it, pattern="^found_it$"),
             ],
+            BROADCAST_WAIT: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_receive),
+            ],
+            BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm, pattern="^broadcast_(go|abort)$"),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CommandHandler("start", start),  # allow /start mid-conversation to reset
+            CommandHandler("start", start),
+            CommandHandler("broadcast", broadcast_command),
         ],
         per_message=False,
     )
