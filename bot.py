@@ -306,7 +306,6 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Automation Logic ----------
 async def _start_auto_promo(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Triggers the first message of the HA1-HA5 sequence."""
     context.job_queue.run_once(
         send_promo_message,
         when=0,
@@ -378,19 +377,24 @@ async def admin_toggle_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_on = bot_data.get("auto_promo", False)
     bot_data["auto_promo"] = not is_on
 
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
     if not is_on:
         # Turning ON
-        await query.message.edit_text("🤖 Auto-Promo: ✅ ON\n\nStarting sequence for all users...")
+        await context.bot.send_message(query.message.chat_id, "🤖 Auto-Promo: ✅ ON\n\nStarting sequence for all users...")
         users = bot_data.get("users", {})
         for uid in users:
-            await _start_auto_promo(int(uid), context)
+            if int(uid) not in ADMIN_IDS:  # Don't spam the admin panel
+                await _start_auto_promo(int(uid), context)
     else:
         # Turning OFF
-        await query.message.edit_text("🤖 Auto-Promo: ❌ OFF\n\nStopping pending messages...")
+        await context.bot.send_message(query.message.chat_id, "🤖 Auto-Promo: ❌ OFF\n\nStopping pending messages...")
         for job in context.job_queue.jobs():
             if job.name and (job.name.startswith("promo_") or job.name.startswith("daily_reset_")):
                 job.schedule_removal()
-        # Small delay so they can read the message before it's replaced
         await asyncio.sleep(2)
 
     # Re-show the admin panel
@@ -553,6 +557,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.effective_chat.id
     user = update.effective_user
 
+    # If user manually types /start, cancel their pending auto-promo jobs so it doesn't clash
+    for job in context.job_queue.jobs():
+        if getattr(job, 'chat_id', None) == chat_id and job.name and (job.name.startswith("promo_") or job.name.startswith("daily_reset_")):
+            job.schedule_removal()
+
     users = context.application.bot_data.setdefault("users", {})
     uid = str(chat_id)
     if uid not in users:
@@ -568,6 +577,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if chat_id in ADMIN_IDS:
         await send_user_list_to_admin(context, chat_id)
+        
         is_auto = context.application.bot_data.get("auto_promo", False)
         auto_btn_text = f"🤖 Auto-Promo: {'✅ ON' if is_auto else '❌ OFF'}"
         
@@ -584,11 +594,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    # If Auto-Promo is active, start the sequence instead of the normal flow
-    if context.application.bot_data.get("auto_promo"):
-        await _start_auto_promo(chat_id, context)
-        return ConversationHandler.END
-
+    # --- THIS IS THE ORIGINAL FLOW, UNTOUCHED ---
     return await _send_language_selection(chat_id, context)
 
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -718,7 +724,7 @@ async def handle_reminder_play(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ---------- Reminder ----------
 async def send_rotating_reminder(context: ContextTypes.DEFAULT_TYPE):
-    # Keep the original 5-hour reminder active ONLY when Auto-Promo is OFF
+    # Pause the 5-hour reminder if Auto-Promo is active so they don't clash
     if context.application.bot_data.get("auto_promo"):
         return
 
@@ -759,7 +765,7 @@ def main() -> None:
 
     application.bot_data["users"] = load_users()
     application.bot_data["reminder_index"] = 0
-    application.bot_data["auto_promo"] = False # Default automation state
+    application.bot_data["auto_promo"] = False
 
     conv_handler = ConversationHandler(
         entry_points=[
