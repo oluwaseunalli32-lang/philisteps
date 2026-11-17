@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # ---------- Configuration ----------
 URL = "https://qtfeh.777haha.cloud/register.html"
 
-# Updated to use HA1.jpg through HA5.jpg
+# Direct GitHub Raw Image URLs
 MESSAGES = [
     {
         "text": (
@@ -23,7 +23,7 @@ MESSAGES = [
             "Check mo na ang promo mechanics para malaman kung paano mag-claim!"
         ),
         "button": "Try your luck",
-        "image": "HA1.jpg"
+        "image_url": "https://raw.githubusercontent.com/oluwaseunalli32-lang/philisteps/main/HA1.jpg"
     },
     {
         "text": (
@@ -32,7 +32,7 @@ MESSAGES = [
             "Maraming exciting games ang puwede mong subukan. Baka mahanap mo na ang bago mong favorite! 🍀"
         ),
         "button": "Our website",
-        "image": "HA2.jpg"
+        "image_url": "https://raw.githubusercontent.com/oluwaseunalli32-lang/philisteps/main/HA2.jpg"
     },
     {
         "text": (
@@ -42,7 +42,7 @@ MESSAGES = [
             "Check muna ang promo terms para alam mo kung magkano ang bonus na puwede mong makuha."
         ),
         "button": "Try your luck",
-        "image": "HA3.jpg"
+        "image_url": "https://raw.githubusercontent.com/oluwaseunalli32-lang/philisteps/main/HA3.jpg"
     },
     {
         "text": (
@@ -53,7 +53,7 @@ MESSAGES = [
             "Check out the game at enjoy the spins! 🎰"
         ),
         "button": "Our website",
-        "image": "HA4.jpg"
+        "image_url": "https://raw.githubusercontent.com/oluwaseunalli32-lang/philisteps/main/HA4.jpg"
     },
     {
         "text": (
@@ -64,14 +64,13 @@ MESSAGES = [
             "Tingnan ang game at alamin kung bakit exciting itong laruin! 🎰"
         ),
         "button": "Try your luck",
-        "image": "HA5.jpg"
+        "image_url": "https://raw.githubusercontent.com/oluwaseunalli32-lang/philisteps/main/HA5.jpg"
     }
 ]
 
 # ---------- Core Functions ----------
 
 async def send_promo_message(context: ContextTypes.DEFAULT_TYPE):
-    """Sends a specific message from the list based on the job's data index."""
     job = context.job
     chat_id = job.chat_id
     index = job.data["index"]
@@ -84,25 +83,23 @@ async def send_promo_message(context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
-        # Construct the absolute path to ensure it works on Render
-        image_path = os.path.join(os.path.dirname(__file__), msg["image"])
-        with open(image_path, "rb") as photo:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=msg["text"],
-                reply_markup=reply_markup
-            )
-            logger.info(f"Sent message {index + 1}/5 to {chat_id}")
-    except FileNotFoundError:
+        # Sending the image directly via GitHub URL
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=msg["image_url"],
+            caption=msg["text"],
+            reply_markup=reply_markup
+        )
+        logger.info(f"Sent message {index + 1}/5 with image to {chat_id}")
+    except Exception as e:
+        logger.error(f"Error sending image URL to {chat_id}: {e}")
+        # Fallback to text only if image fails
         await context.bot.send_message(
             chat_id=chat_id,
             text=msg["text"],
             reply_markup=reply_markup
         )
-        logger.warning(f"Image {msg['image']} not found. Sent text only to {chat_id}.")
-    except Exception as e:
-        logger.error(f"Error sending message to {chat_id}: {e}")
+        logger.warning(f"Image failed. Sent text only to {chat_id}.")
 
     # Schedule the NEXT message 1 hour later (3600 seconds)
     if index + 1 < len(MESSAGES):
@@ -115,7 +112,6 @@ async def send_promo_message(context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggered when a user sends /start"""
     chat_id = update.effective_chat.id
     
     # Cancel ALL existing jobs for this user to prevent double-spamming
@@ -142,7 +138,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def restart_daily_sequence(context: ContextTypes.DEFAULT_TYPE):
-    """Triggers the first message again the next day."""
     job = context.job
     chat_id = job.chat_id
     
@@ -156,17 +151,15 @@ async def restart_daily_sequence(context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Main ----------
 def main() -> None:
-    # Render uses environment variables, this is the standard way to get the token
     TOKEN = os.environ.get("BOT_TOKEN")
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
     application = Application.builder().token(TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
 
     logger.info("Promo bot is starting (polling)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    main()
+    main()z
